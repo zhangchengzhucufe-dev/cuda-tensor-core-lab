@@ -114,7 +114,14 @@ __global__ void tcgen05_tile(const __nv_bfloat16* gA, const __nv_bfloat16* gB,
                 ".shared::cluster.b64 [%0];" ::"r"(mbar_u32)
                 : "memory");
         }
-        mbar_wait(mbar_u32, 0);
+        // bug 修复:parity 要随轮次翻转。mbarrier 每完成一次相位就翻转
+        // (0→1→0→…),第 round 次完成对应 parity = round&1。原代码每轮
+        // 都等 phase 0:第 0 轮没问题;从第 1 轮起 phase 0 早已完成,
+        // try_wait 立刻放行,所有 warp 在 mma 还在飞的时候就去
+        // tcgen05.ld 读 TMEM,读到的是上一轮(甚至写到一半)的结果——
+        // rounds>=2 必错、且数据看起来"像是少了前几轮的累加";
+        // rounds==1 恰好正确,所以现象是 1 对、2/4 错。
+        mbar_wait(mbar_u32, (uint32_t)(round & 1));
         asm volatile("tcgen05.fence::after_thread_sync;");
         for (int c = 0; c < N; c += 8) {
             uint32_t src = taddr + ((uint32_t)(warp * 32) << 16) + c;

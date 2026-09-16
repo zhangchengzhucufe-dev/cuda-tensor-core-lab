@@ -19,10 +19,20 @@
 #include <cstdio>
 #include <cstring>
 
-// TODO: 实现三个映射。
-static int swizzle_128B(int row, int colByte) { (void)row; return colByte; }
-static int swizzle_64B(int row, int colByte) { (void)row; return colByte; }
-static int swizzle_32B(int row, int colByte) { (void)row; return colByte; }
+// 通用模式:行内 16B chunk 的下标与行号的低位做 XOR,参与异或的位数
+// 取决于行宽——128B 行有 8 个 chunk(3 bit)↔ row 低 3 bit;64B 行有
+// 4 个 chunk(2 bit)↔ row 低 2 bit;32B 行 2 个 chunk(1 bit)↔ row 低
+// 1 bit。16B 以内的低位不动。这正好保证:固定逻辑 chunk、扫一个周期
+// 的行,物理 chunk 两两不同(列访问无 bank conflict)。
+static int swizzle_128B(int row, int colByte) {
+    return row * 128 + (colByte ^ ((row & 7) << 4));
+}
+static int swizzle_64B(int row, int colByte) {
+    return row * 64 + (colByte ^ ((row & 3) << 4));
+}
+static int swizzle_32B(int row, int colByte) {
+    return row * 32 + (colByte ^ ((row & 1) << 4));
+}
 
 // 以下为判测,不需要修改。
 static int check_mode(const char* name, int (*fn)(int, int), int rowBytes,

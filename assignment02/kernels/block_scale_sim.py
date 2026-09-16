@@ -33,20 +33,32 @@ def gemm_scale_per_row_col(A: torch.Tensor, B: torch.Tensor,
                            sA: torch.Tensor, sB: torch.Tensor) -> torch.Tensor:
     """sA: [M]，sB: [N]，均为正数。
 
-    TODO: 先用 row/column scale 得到归一化的 A、B，完整点积后
-    在输出 [M, N] 上乘回 scale 乘积。
+    row/column scale 在整个点积里都是常数，可以从求和里提出来：
+    sum_k (a_k/sA)(b_k/sB) * sA*sB = sum_k a_k b_k，
+    所以归一化后完整点积，最后在 [M, N] 上乘回一次 sA ⊗ sB。
     """
-    raise NotImplementedError
+    qA = A.double() / sA[:, None]
+    qB = B.double() / sB[:, None]
+    return (qA @ qB.T) * sA[:, None] * sB[None, :]
 
 
 def gemm_scale_along_k(A: torch.Tensor, B: torch.Tensor,
                        sA: torch.Tensor, sB: torch.Tensor) -> torch.Tensor:
     """sA: [M, K//SEG]，sB: [N, K//SEG]，均为正数。
 
-    TODO: 逐个 K block 计算归一化 partial sum，在段末乘回
-    该段的 sA*sB，再累加。返回 [M, N] 的 fp64 结果。
+    scale 乘积随 K 段变化，不能从整个和式里提出——
+    sum_k x_k * c_k ≠ (sum_k x_k) * c_anything。
+    所以每个 K block 的归一化 partial sum 要先乘回该段的 sA*sB 再累加。
     """
-    raise NotImplementedError
+    M, K = A.shape
+    N = B.shape[0]
+    out = torch.zeros((M, N), dtype=torch.float64)
+    for block in range(K // SEG):
+        sl = slice(block * SEG, (block + 1) * SEG)
+        qA = A[:, sl].double() / sA[:, block, None]
+        qB = B[:, sl].double() / sB[:, block, None]
+        out += (qA @ qB.T) * sA[:, block, None] * sB[None, :, block]
+    return out
 
 
 def gemm_scale_along_k_one_restore(A: torch.Tensor, B: torch.Tensor,

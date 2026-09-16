@@ -28,10 +28,12 @@ int main() {
     CUDA_CHECK(cudaMemcpy(d_b, h_b, bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(d_c, 0, bytes));
 
-    int threads = 2048;
+    int threads = 1024;  // bug 修复：2048 超过了每 block 最大线程数（这块卡是 1024），
+                         // launch 直接无效，kernel 根本没跑；加上错误检查就能看到
+                         // cudaErrorInvalidConfiguration。
     int blocks = (n + threads - 1) / threads;
     vectorAdd<<<blocks, threads>>>(d_a, d_b, d_c, n);
-    // 注意：这里故意没有做任何错误检查。
+    CUDA_CHECK_KERNEL();  // kernel launch 没有返回值，要用它把启动错误抓出来
 
     CUDA_CHECK(cudaMemcpy(h_c, d_c, bytes, cudaMemcpyDeviceToHost));
     REPORT(check_close(h_c, h_ref, n));

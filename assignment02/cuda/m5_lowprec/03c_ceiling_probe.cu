@@ -19,13 +19,42 @@ template <int BLOCK>
 __global__ void probe_kernel(const __nv_bfloat16* __restrict__ in,
                              uint8_t* __restrict__ dataOut,
                              uint8_t* __restrict__ sfOut, int M, int K) {
-    // TODO: 与你的 quant kernel 同形的访存,xor 直通,无数学。
+    // 与 quant kernel 完全相同的访存形状:一线程一组,读 16 个 bf16,
+    // 写 8 byte 数据 + 1 byte SF;区别只是不量化,读进来的位 xor 后
+    // 直通(防编译器把访存优化掉)。
+    long g = (long)blockIdx.x * BLOCK + threadIdx.x;
+    int groupsPerRow = K / NVFP4_GROUP;
+    long total = (long)M * groupsPerRow;
+    if (g >= total) return;
+    int r = (int)(g / groupsPerRow);
+    int kg = (int)(g % groupsPerRow);
+
+    const uint16_t* row = reinterpret_cast<const uint16_t*>(
+        in + (size_t)r * K + kg * NVFP4_GROUP);
+    uint8_t out[NVFP4_GROUP / 2];
+    uint8_t acc = 0;
+#pragma unroll
+    for (int i = 0; i < NVFP4_GROUP; i += 2) {
+        uint16_t a = row[i], b = row[i + 1];
+        uint8_t lo = (uint8_t)(a ^ b);
+        uint8_t hi = (uint8_t)((a >> 8) ^ (b >> 8));
+        out[i / 2] = (uint8_t)((hi << 4) | lo);
+        acc ^= lo ^ hi;
+    }
+    uint8_t* dst =
+        dataOut + ((size_t)r * K / 2 + kg * (NVFP4_GROUP / 2));
+#pragma unroll
+    for (int i = 0; i < NVFP4_GROUP / 2; i++) dst[i] = out[i];
+    sfOut[sf_swizzled_offset(r, kg, nvfp4_num_ktiles(K))] = acc;
 }
 
 static void launch_probe(const __nv_bfloat16* in, uint8_t* dataOut,
                          uint8_t* sfOut, int M, int K, int sms) {
-    // TODO: 启动配置。
-    (void)in; (void)dataOut; (void)sfOut; (void)M; (void)K; (void)sms;
+    // 启动配置与 launch_nvfp4_quant 完全一致,保证对比公平。
+    constexpr int BLOCK = 256;
+    long total = (long)M * (K / NVFP4_GROUP);
+    int grid = (int)((total + BLOCK - 1) / BLOCK);
+    probe_kernel<BLOCK><<<grid, BLOCK>>>(in, dataOut, sfOut, M, K);
 }
 
 int main() {

@@ -82,21 +82,89 @@ __global__ void rms_norm_baseline_kernel(const __nv_bfloat16* __restrict__ in,
     }
 }
 
-// TODO(核心):融合 kernel。签名自定,在 launch_fused 里接上。
+// 融合 kernel:一个 block 负责一行,阶段 1 归约 sumsq 得 rnorm,
+// 阶段 2 逐组做 5.3(b) 的量化(不写 bf16 中间结果)。
+template <int BLOCK>
+__global__ void fused_rms_nvfp4_kernel(const __nv_bfloat16* __restrict__ in,
+                                       const __nv_bfloat16* __restrict__ w,
+                                       uint8_t* __restrict__ dataOut,
+                                       uint8_t* __restrict__ sfOut, int M,
+                                       int K, float eps) {
+    int row = blockIdx.x;
+    if (row >= M) return;
+    const __nv_bfloat16* xr = in + (size_t)row * K;
+    __shared__ float red[BLOCK / 32];
+
+    // 阶段 1:sumsq(每线程 8 元素 float4 步进 + shuffle 树形归约)
+    float ss = 0.f;
+    for (int k = threadIdx.x * 8; k < K; k += BLOCK * 8) {
+        float4 raw = *reinterpret_cast<const float4*>(xr + k);
+        const __nv_bfloat162* h =
+            reinterpret_cast<const __nv_bfloat162*>(&raw);
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float2 f = __bfloat1622float2(h[i]);
+            ss += f.x * f.x + f.y * f.y;
+        }
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) ss += __shfl_down_sync(~0u, ss, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        ss = threadIdx.x < BLOCK / 32 ? red[threadIdx.x] : 0.f;
+#pragma unroll
+        for (int o = 16; o; o >>= 1) ss += __shfl_down_sync(~0u, ss, o);
+        if (threadIdx.x == 0) red[0] = ss;
+    }
+    __syncthreads();
+    float rnorm = 1.0f / sqrtf(red[0] / K + eps);
+
+    // 阶段 2:一线程一组地量化,与 5.3(b) 相同的顺序
+    int numKTiles = nvfp4_num_ktiles(K);
+    int groupsPerRow = K / NVFP4_GROUP;
+    for (int g = threadIdx.x; g < groupsPerRow; g += BLOCK) {
+        const __nv_bfloat16* xg = xr + g * NVFP4_GROUP;
+        const __nv_bfloat16* wg = w + g * NVFP4_GROUP;
+        float vals[NVFP4_GROUP], amax = 0.f;
+#pragma unroll
+        for (int i = 0; i < NVFP4_GROUP; i++) {
+            float v = __bfloat162float(xg[i]) * rnorm *
+                      __bfloat162float(wg[i]);
+            vals[i] = v;
+            amax = fmaxf(amax, fabsf(v));
+        }
+        __nv_fp8_e4m3 sf8 = __nv_fp8_e4m3(amax / 6.0f);
+        float s = float(sf8);
+        float inv = s != 0.f ? 1.0f / s : 0.0f;
+        sfOut[sf_swizzled_offset(row, g, numKTiles)] = *(uint8_t*)&sf8;
+        uint8_t* dst = dataOut + ((size_t)row * K / 2 + g * (NVFP4_GROUP / 2));
+#pragma unroll
+        for (int i = 0; i < NVFP4_GROUP; i += 2) {
+            __nv_fp4x2_e2m1 p =
+                __nv_fp4x2_e2m1(make_float2(vals[i] * inv, vals[i + 1] * inv));
+            dst[i / 2] = *reinterpret_cast<uint8_t*>(&p);
+        }
+    }
+}
+
 static void launch_fused(const __nv_bfloat16* in, const __nv_bfloat16* w,
                          uint8_t* dataOut, uint8_t* sfOut, int M, int K,
                          float eps, int sms) {
-    // TODO
-    (void)in; (void)w; (void)dataOut; (void)sfOut; (void)M; (void)K;
-    (void)eps; (void)sms;
+    // 一行一个 block;行数少时一个 block 也能盖住整行(K<=8192,
+    // 256 线程 x 8 元素 x 多轮),行数多时 block 数天然铺满。
+    (void)sms;
+    fused_rms_nvfp4_kernel<256><<<M, 256>>>(in, w, dataOut, sfOut, M, K, eps);
 }
 
-// TODO(公平基线):两步各自的最优启动配置。默认给的是一个起点。
+// 公平基线:两步各自单独调优。rms_norm 的 grid/block 在这里给的是
+// 经验起点,对比前应在真机上扫一遍 {256,512,1024} x {M, sms, 2sms, 4sms}
+// 取两步各自最优(报告要求:基线吃亏的对比没有意义)。
 static void launch_two_step(const __nv_bfloat16* in, const __nv_bfloat16* w,
                             __nv_bfloat16* mid, uint8_t* dataOut,
                             uint8_t* sfOut, int M, int K, float eps,
                             int sms) {
-    int grid = M < sms ? M : sms * 2;
+    int grid = M < sms * 4 ? M : sms * 4;
     rms_norm_baseline_kernel<512><<<grid, 512>>>(in, w, mid, M, K, eps);
     launch_nvfp4_quant(mid, dataOut, sfOut, M, K, sms);
 }

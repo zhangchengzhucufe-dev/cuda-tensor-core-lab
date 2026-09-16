@@ -88,23 +88,165 @@ __global__ void gemm_pipeline(const __nv_bfloat16* gA, const __nv_bfloat16* gB,
     uint8_t* smem =
         (uint8_t*)(((uintptr_t)smem_raw + 1023) & ~(uintptr_t)1023);
 
-    // TODO:把你 4.2 的 kernel 扩成 NSTAGE 级流水。参考结构:
-    // (1) smem 划成 NSTAGE 段,stage s 的 A/B 起点自己排;mbarrier 每
-    //     stage 两个:full[s](TMA 到达)、empty[s](mma 消费完成)
-    // (2) 预热:先发 min(NSTAGE, iters) 轮 TMA(发第 it 轮 = 对 stage
-    //     it%NSTAGE 做 arrive.expect_tx + 两条 cp.async.bulk.tensor)
-    // (3) 主循环 it:
-    //     - 强制发射:若第 it 轮 TMA 还没发,阻塞等 empty[it%NSTAGE]
-    //       后补发(见文件头 hazard;empty 的 parity 按该 stage 被复用
-    //       的轮次算,第一次复用等的是上一轮使用的完成)
-    //     - 机会式深预取:try_wait 下一个待发 stage 的 empty,成功就
-    //       继续发,失败立刻停,不许阻塞
-    //     - 等 full[it%NSTAGE](parity = (it/NSTAGE)&1)→ tcgen05.fence
-    //       → mma(与 4.2 相同,累加位口径不变)→ commit 到
-    //       empty[it%NSTAGE]
-    // (4) drain:等最后一轮 mma 的 empty 到达,再进 epilogue
-    (void)gA; (void)gB; (void)gD; (void)M; (void)N; (void)K;
-    (void)tmapA; (void)tmapB; (void)smem;
+    // (1) NSTAGE 段 smem(每段 A 在前、B 在后,布局同 4.2 的单缓冲),
+    //     每 stage 一对 mbarrier:full[s] / empty[s]
+    __shared__ __align__(8) uint64_t mbar_full[NSTAGE];
+    __shared__ __align__(8) uint64_t mbar_empty[NSTAGE];
+    __shared__ uint32_t s_taddr[1];
+    int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    uint32_t full_u32[NSTAGE], empty_u32[NSTAGE];
+    if (warp == 0 && lane == 0) {
+#pragma unroll
+        for (int s = 0; s < NSTAGE; s++) {
+            full_u32[s] = (uint32_t)__cvta_generic_to_shared(&mbar_full[s]);
+            empty_u32[s] = (uint32_t)__cvta_generic_to_shared(&mbar_empty[s]);
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(
+                             full_u32[s]),
+                         "r"(1));
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(
+                             empty_u32[s]),
+                         "r"(1));
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;");
+    }
+    if (warp == 0) {
+        uint32_t dst = (uint32_t)__cvta_generic_to_shared(s_taddr);
+        asm volatile(
+            "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], "
+            "%1;" ::"r"(dst),
+            "r"(64));
+        asm volatile(
+            "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+    }
+    __syncthreads();
+    uint32_t taddr = s_taddr[0];
+#pragma unroll
+    for (int s = 0; s < NSTAGE; s++) {
+        full_u32[s] = (uint32_t)__cvta_generic_to_shared(&mbar_full[s]);
+        empty_u32[s] = (uint32_t)__cvta_generic_to_shared(&mbar_empty[s]);
+    }
+
+    int tileM = blockIdx.x * BM;
+    int tileN = blockIdx.y * BN;
+    uint32_t elected;
+    asm volatile(
+        "{\n.reg .pred P;\nelect.sync _|P, 0xFFFFFFFF;\nselp.b32 %0, 1, 0, "
+        "P;\n}"
+        : "=r"(elected));
+    uint32_t idesc =
+        (1u << 4) | (1u << 7) | (1u << 10) | (8u << 17) | (8u << 24);
+    uint32_t txBytes = (BM + BN) * BK * 2;
+    uint32_t smemA = (uint32_t)__cvta_generic_to_shared(smem);
+    int iters = K / BK;
+
+    // 发第 it 轮 TMA 到 stage it%NSTAGE(仅 elected 线程调用)
+    auto issue_tma = [&](int it) {
+        int s = it % NSTAGE;
+        uint32_t stageBase = smemA + (uint32_t)s * txBytes;
+        asm volatile(
+            "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(
+                full_u32[s]),
+            "r"(txBytes));
+        asm volatile(
+            "cp.async.bulk.tensor.2d.shared::cluster.global"
+            ".mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];" ::"r"(
+                stageBase),
+            "l"((unsigned long long)&tmapA), "r"(it * BK), "r"(tileM),
+            "r"(full_u32[s])
+            : "memory");
+        asm volatile(
+            "cp.async.bulk.tensor.2d.shared::cluster.global"
+            ".mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];" ::"r"(
+                stageBase + (uint32_t)BM * BK * 2),
+            "l"((unsigned long long)&tmapB), "r"(it * BK), "r"(tileN),
+            "r"(full_u32[s])
+            : "memory");
+    };
+
+    // (2) 预热:先发 min(NSTAGE, iters) 轮(初始所有 stage 都是空的)
+    int issued = iters < NSTAGE ? iters : NSTAGE;
+    if (warp == 0 && elected)
+        for (int it = 0; it < issued; it++) issue_tma(it);
+
+    // (3) 主循环
+    for (int it = 0; it < iters; it++) {
+        int s = it % NSTAGE;
+        // 强制发射:第 it 轮的 TMA 若还没发(流水冷启动尾部或上一拍
+        // 机会式预取没排上),必须阻塞等 empty[s] 再补发——
+        // 用机会式 try_wait 代替这里的阻塞等,一旦某轮检查时 stage
+        // 未空而被跳过,后面 wait full 等的就是一条永远不会到来的拷贝,
+        // 死锁(1024^3 侥幸,4096^3 必挂的那个 hazard)。
+        if (issued <= it) {
+            // empty[s] 被用了 it/NSTAGE 次(本轮是第 it/NSTAGE+1 次),
+            // 它的第 j 次相位完成 parity = j&1,上一轮使用 = 第
+            // it/NSTAGE-1 次完成
+            mbar_wait(empty_u32[s],
+                      (uint32_t)(((it / NSTAGE) - 1) & 1));
+            if (warp == 0 && elected) issue_tma(it);
+            issued = it + 1;
+        }
+        // 机会式深预取:能发就发,发不动立刻停,绝不阻塞
+        if (warp == 0 && elected) {
+            while (issued < iters) {
+                int t = issued % NSTAGE;
+                if (!mbar_try(empty_u32[t],
+                              (uint32_t)(((issued / NSTAGE) - 1) & 1)))
+                    break;
+                issue_tma(issued);
+                issued++;
+            }
+        }
+        // 等本轮数据到齐 → mma 消费 → commit 到 empty[s]
+        mbar_wait(full_u32[s], (uint32_t)((it / NSTAGE) & 1));
+        asm volatile("tcgen05.fence::after_thread_sync;");
+        if (warp == 0 && elected) {
+            uint32_t stageA = smemA + (uint32_t)s * txBytes;
+            uint32_t stageB = stageA + (uint32_t)BM * BK * 2;
+#pragma unroll
+            for (int kk = 0; kk < BK; kk += 16) {
+                bool first = (it == 0 && kk == 0);
+                uint64_t da = make_desc_sm100(stageA + kk * 2, 0, 1024, 2);
+                uint64_t db = make_desc_sm100(stageB + kk * 2, 0, 1024, 2);
+                asm volatile(
+                    "{\n.reg .pred p;\nsetp.ne.b32 p, %4, 0;\n"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, "
+                    "p;\n}\n" ::"r"(taddr),
+                    "l"(da), "l"(db), "r"(idesc), "r"(first ? 0u : 1u));
+            }
+            asm volatile(
+                "tcgen05.commit.cta_group::1.mbarrier::arrive::one"
+                ".shared::cluster.b64 [%0];" ::"r"(empty_u32[s])
+                : "memory");
+        }
+    }
+
+    // (4) drain:等最后一轮 mma 完成,再进 epilogue
+    mbar_wait(empty_u32[(iters - 1) % NSTAGE],
+              (uint32_t)(((iters - 1) / NSTAGE) & 1));
+    asm volatile("tcgen05.fence::after_thread_sync;");
+
+    // epilogue(与 4.1/4.2 相同)
+    for (int c = 0; c < BN; c += 8) {
+        uint32_t src = taddr + ((uint32_t)(warp * 32) << 16) + c;
+        float r[8];
+        asm volatile(
+            "tcgen05.ld.sync.aligned.32x32b.x8.b32 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+            : "=f"(r[0]), "=f"(r[1]), "=f"(r[2]), "=f"(r[3]), "=f"(r[4]),
+              "=f"(r[5]), "=f"(r[6]), "=f"(r[7])
+            : "r"(src));
+        asm volatile("tcgen05.wait::ld.sync.aligned;");
+        int row = tileM + warp * 32 + lane;
+#pragma unroll
+        for (int i = 0; i < 8; i++) gD[(size_t)row * N + tileN + c + i] = r[i];
+    }
+
+    __syncthreads();
+    if (warp == 0)
+        asm volatile(
+            "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(
+                taddr),
+            "r"(64));
 }
 
 int main(int argc, char** argv) {
@@ -131,8 +273,26 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(dB, hB.data(), nB * 2, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(dD, 0xFF, nD * 4));
 
-    // TODO:tensor map 从你的 4.2 原样复制。
+    // tensor map:从 4.2 原样复制。
     CUtensorMap tmapA = {}, tmapB = {};
+    auto make_tmap = [&](void* gptr, int rows, cuuint32_t boxRows,
+                        CUtensorMap* tmap) -> CUresult {
+        cuuint64_t dims[2] = {(cuuint64_t)K, (cuuint64_t)rows};
+        cuuint64_t strides[1] = {(cuuint64_t)K * 2};
+        cuuint32_t box[2] = {BK, boxRows};
+        cuuint32_t estr[2] = {1, 1};
+        return cuTensorMapEncodeTiled(
+            tmap, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, gptr, dims, strides,
+            box, estr, CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    };
+    CUresult ra = make_tmap(dA, M, BM, &tmapA);
+    CUresult rb = make_tmap(dB, N, BN, &tmapB);
+    if (ra != CUDA_SUCCESS || rb != CUDA_SUCCESS) {
+        printf("cuTensorMapEncodeTiled failed: A=%d B=%d\n", (int)ra, (int)rb);
+        return 1;
+    }
 
     dim3 grid(M / BM, N / BN);
     // NSTAGE=3 时 72KB+对齐余量,超 48KB 静态上限,动态 smem 必须。

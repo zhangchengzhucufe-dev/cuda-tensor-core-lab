@@ -29,12 +29,42 @@ template <int BLOCK>
 __global__ void nvfp4_quant_kernel(const __nv_bfloat16* __restrict__ in,
                                    uint8_t* __restrict__ dataOut,
                                    uint8_t* __restrict__ sfOut, int M, int K) {
-    // TODO: 实现。
+    // 一线程一组:全局组编号 -> (行, 行内第几个组)
+    long g = (long)blockIdx.x * BLOCK + threadIdx.x;
+    int groupsPerRow = K / NVFP4_GROUP;
+    long total = (long)M * groupsPerRow;
+    if (g >= total) return;
+    int r = (int)(g / groupsPerRow);
+    int kg = (int)(g % groupsPerRow);
+
+    const __nv_bfloat16* row = in + (size_t)r * K + kg * NVFP4_GROUP;
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < NVFP4_GROUP; i++)
+        amax = fmaxf(amax, fabsf(__bfloat162float(row[i])));
+
+    __nv_fp8_e4m3 sf8 = __nv_fp8_e4m3(amax / 6.0f);
+    float s = float(sf8);
+    float inv = s != 0.f ? 1.0f / s : 0.0f;
+    sfOut[sf_swizzled_offset(r, kg, nvfp4_num_ktiles(K))] =
+        *(uint8_t*)&sf8;
+
+    // 逐对转 e2m1 并打包:低 nibble 放偶数下标元素
+    uint8_t* dst = dataOut + ((size_t)r * K / 2 + kg * (NVFP4_GROUP / 2));
+#pragma unroll
+    for (int i = 0; i < NVFP4_GROUP; i += 2) {
+        float v0 = __bfloat162float(row[i]) * inv;
+        float v1 = __bfloat162float(row[i + 1]) * inv;
+        __nv_fp4x2_e2m1 p = __nv_fp4x2_e2m1(make_float2(v0, v1));
+        dst[i / 2] = *reinterpret_cast<uint8_t*>(&p);
+    }
 }
 
 // 判测和 5.4 会按这个签名调用;grid 大小你自己定,写在这里。
 inline void launch_nvfp4_quant(const __nv_bfloat16* in, uint8_t* dataOut,
                                uint8_t* sfOut, int M, int K, int sms) {
-    // TODO: 选择 grid/block 并启动 nvfp4_quant_kernel。
-    (void)in; (void)dataOut; (void)sfOut; (void)M; (void)K; (void)sms;
+    constexpr int BLOCK = 256;
+    long total = (long)M * (K / NVFP4_GROUP);
+    int grid = (int)((total + BLOCK - 1) / BLOCK);
+    nvfp4_quant_kernel<BLOCK><<<grid, BLOCK>>>(in, dataOut, sfOut, M, K);
 }

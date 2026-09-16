@@ -20,4 +20,38 @@ contract: 实现 run(program) -> (regs, cycles)
 
 
 def run(program):
-    raise NotImplementedError("从这里开始写")
+    regs = list(range(32))
+
+    # exec_block 返回这段程序消耗的拍数，只改 active 的 lane。
+    def exec_block(prog, active):
+        cycles = 0
+        for inst in prog:
+            if inst[0] == "add":
+                k = inst[1]
+                for i in range(32):
+                    if active[i]:
+                        regs[i] += k
+                cycles += 1
+            elif inst[0] == "mul":
+                k = inst[1]
+                for i in range(32):
+                    if active[i]:
+                        regs[i] *= k
+                cycles += 1
+            elif inst[0] == "if_lt":
+                t, then_prog, else_prog = inst[1], inst[2], inst[3]
+                # 按 reg < t 把 active 的 lane 再切成两半；
+                # 两个分支各自在"父 mask ∩ 分支条件"上执行。
+                then_active = [active[i] and regs[i] < t for i in range(32)]
+                else_active = [active[i] and regs[i] >= t for i in range(32)]
+                if any(then_active):
+                    cycles += exec_block(then_prog, then_active)
+                if any(else_active):
+                    cycles += exec_block(else_prog, else_active)
+                # 汇合：if_lt 本身不计拍。
+            else:
+                raise ValueError(f"unknown instruction: {inst!r}")
+        return cycles
+
+    cycles = exec_block(program, [True] * 32)
+    return regs, cycles

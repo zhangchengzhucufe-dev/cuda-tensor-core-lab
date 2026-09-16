@@ -7,8 +7,13 @@
 #include "common.h"
 
 __global__ void vectorAdd(const float *a, const float *b, float *c, int n) {
+    // grid-stride loop：起点是本线程的全局编号，步长是整个 grid 的线程总数。
+    // 这样不管 n 多大、launch 给多少线程，每个元素都有线程负责。
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < n) c[idx] = a[idx] + b[idx];
+    int stride = blockDim.x * gridDim.x;
+    for (int i = idx; i < n; i += stride) {
+        c[i] = a[i] + b[i];
+    }
 }
 
 int main() {

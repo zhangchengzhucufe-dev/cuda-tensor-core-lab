@@ -39,11 +39,59 @@
 #define BLOCK 256
 
 __global__ void reduce_interleaved(const float *in, float *out) {
-    // TODO：从这里开始写（交错配对版本）
+    // 交错配对：步长 s = 1, 2, 4, ..., 128，tid % (2*s) == 0 的线程干活。
+    // 活跃线程隔一个一个，一个 warp 里最多一半线程在同一条路上。
+    __shared__ float buf[BLOCK];
+    int t = threadIdx.x;
+    buf[t] = in[blockIdx.x * blockDim.x + t];
+    __syncthreads();
+    for (int s = 1; s < blockDim.x; s <<= 1) {
+        if (t % (2 * s) == 0) {
+            buf[t] += buf[t + s];
+        }
+        __syncthreads();
+    }
+    if (t == 0) out[blockIdx.x] = buf[0];
 }
 
 __global__ void reduce_contiguous(const float *in, float *out) {
-    // TODO：从这里开始写（连续配对版本）
+    // 连续配对：步长 s = 128, 64, ..., 1，tid < s 的线程干活。
+    // 活跃线程挤在编号低的一头，靠 warp 边界自然收拢，divergence 少。
+    __shared__ float buf[BLOCK];
+    int t = threadIdx.x;
+    buf[t] = in[blockIdx.x * blockDim.x + t];
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (t < s) {
+            buf[t] += buf[t + s];
+        }
+        __syncthreads();
+    }
+    if (t == 0) out[blockIdx.x] = buf[0];
+}
+
+// 选做第三版：warp shuffle 归约。warp 内用 __shfl_down_sync 直接在寄存器之间
+// 交换数据（自带同步、不占 shared memory），每个 warp 先局部归约成 1 个数，
+// 8 个 warp 的部分和落回 shared，再由第 0 个 warp 用同样方式归约一次。
+__global__ void reduce_shuffle(const float *in, float *out) {
+    __shared__ float warp_sums[BLOCK / 32];
+    int t = threadIdx.x;
+    float v = in[blockIdx.x * blockDim.x + t];
+
+    for (int off = 16; off > 0; off >>= 1)
+        v += __shfl_down_sync(0xffffffffu, v, off);
+
+    if ((t & 31) == 0) warp_sums[t >> 5] = v;
+    __syncthreads();
+
+    // 256 = 8 个 warp，归约到最后只剩 8 个数，全落在第 0 个 warp 里，
+    // 后面这轮只需要 warp 内的通信，不再需要 __syncthreads。
+    if (t < 32) {
+        float w = (t < BLOCK / 32) ? warp_sums[t] : 0.f;
+        for (int off = 16; off > 0; off >>= 1)
+            w += __shfl_down_sync(0xffffffffu, w, off);
+        if (t == 0) out[blockIdx.x] = w;
+    }
 }
 
 // ---------------- 以下是判测与计时，不要修改 ----------------
@@ -101,6 +149,10 @@ int main() {
     // 阈值 1.5x：A100 实测 2.22x、V100 实测 2.33x，两版写成一样时是 ~1x。
     float ratio = report_speedup("interleaved / contiguous", ms_i, ms_c, 1.5f,
                                  "两版耗时几乎一样，检查是不是写成同一个实现了");
+
+    // 选做的 shuffle 版：照着加一次调用，不影响上面两版的判测。
+    run_one(reduce_shuffle, "shuffle(warp) ", d_in, d_out, h_out, h_partial,
+            nblocks);
 
     char metrics[192];
     snprintf(metrics, sizeof(metrics),

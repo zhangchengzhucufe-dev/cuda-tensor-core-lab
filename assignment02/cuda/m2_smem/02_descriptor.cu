@@ -22,18 +22,32 @@
 #include <cstdio>
 #include <cstdint>
 
-// TODO (a):实现位域编码。
+// (a) 按位域编码:各字段值先右移 4(16B 粒度)再放进自己的位段,
+//     version 固定 1,layout 直接占 bit[61,64)。
 static uint64_t make_desc(uint32_t saddr, uint32_t lbo, uint32_t sbo,
                           uint32_t layout) {
-    (void)saddr; (void)lbo; (void)sbo; (void)layout;
-    return 0;
+    uint64_t d = 0;
+    d |= (uint64_t)((saddr >> 4) & 0x3FFFu);
+    d |= (uint64_t)((lbo >> 4) & 0x3FFFu) << 16;
+    d |= (uint64_t)((sbo >> 4) & 0x3FFFu) << 32;
+    d |= (uint64_t)1 << 46;  // version = 1
+    d |= (uint64_t)(layout & 0x7u) << 61;
+    return d;
 }
 
-// TODO (b):三个场景的 {LBO 字节, SBO 字节, layout 编码}。
+// (b) 场景 1(K-major 无 swizzle):atom = 8k x 8n(16B),atom 内 8 个 n
+//     紧密打包成 128B。leading 方向沿 K:相邻 atom(K+8)差 128B → LBO=128;
+//     strided 方向沿 N:相邻 atom(N+8)跨过一整个 n 组 = 8n x 64k x 2B
+//     = 1024B → SBO=1024;layout = NONE。
+// 场景 2(K-major 128B swizzle):LBO 被硬件忽略填 0;swizzle 后 atom 仍按
+//     128B 一块、n 组之间还是 1024B → SBO=1024;layout = 128B(编码 2)。
+// 场景 3(MN-major 128B swizzle):atom = 8n x 16B 沿 N 连续;strided 方向
+//     沿 K:8k x 64n x 2B = 1024B → SBO=1024;LBO 忽略填 0;layout = 128B。
+//     (64x64 的 tile 让两个方向的 SBO 算出来恰好一样,所以和场景 2 全同。)
 static const uint32_t SCEN[3][3] = {
-    {0, 0, 0},  // 场景 1
-    {0, 0, 0},  // 场景 2
-    {0, 0, 0},  // 场景 3
+    {128, 1024, 0},  // 场景 1:K-major,无 swizzle
+    {0, 1024, 2},    // 场景 2:K-major,128B swizzle
+    {0, 1024, 2},    // 场景 3:MN-major,128B swizzle
 };
 
 // 以下为判测,不需要修改。不匹配时按字段报差异,不打印期望值。

@@ -23,6 +23,51 @@ import torch
 import tilelang
 import tilelang.language as T
 
+_kernel_cache = {}
+
+
+def _next_pow2(n: int) -> int:
+    return 1 << (n - 1).bit_length()
+
+
+def make_softmax(M, N, dtype="float32", threads=128):
+    # fragment 宽度取不小于 N 的 2 的幂；不足的位置补 -inf。
+    BLOCK_N = _next_pow2(max(N, 1))
+
+    @T.prim_func
+    def softmax_kernel(
+        X: T.Buffer((M, N), dtype),
+        Y: T.Buffer((M, N), dtype),
+    ):
+        with T.Kernel(M, threads=threads) as (m):
+            row = T.alloc_fragment((BLOCK_N,), dtype)
+            row_max = T.alloc_fragment((1,), dtype)
+            row_sum = T.alloc_fragment((1,), dtype)
+
+            # 装载：j >= N 的位置补 -inf（读 global 时把下标夹在 N-1，
+            # 避免越界，值反正会被 -inf 盖掉）。
+            for j in T.Parallel(BLOCK_N):
+                row[j] = T.if_then_else(
+                    j < N, X[m, T.min(j, N - 1)], -T.infinity(dtype))
+
+            # 数值稳定的关键：先减掉行内最大值，exp 的参数最大是 0，不会溢出。
+            T.reduce_max(row, row_max, dim=0, clear=True)
+            for j in T.Parallel(BLOCK_N):
+                row[j] = T.exp(row[j] - row_max[0])
+            T.reduce_sum(row, row_sum, dim=0, clear=True)
+
+            # 写回：只写前 N 个位置。
+            for j in T.Parallel(N):
+                Y[m, j] = row[j] / row_sum[0]
+
+    return softmax_kernel
+
 
 def softmax(x: torch.Tensor) -> torch.Tensor:
-    raise NotImplementedError("从这里开始写")
+    M, N = x.shape
+    key = (M, N)
+    if key not in _kernel_cache:
+        _kernel_cache[key] = tilelang.compile(make_softmax(M, N))
+    y = torch.empty_like(x)
+    _kernel_cache[key](x, y)
+    return y

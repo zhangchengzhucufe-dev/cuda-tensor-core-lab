@@ -23,17 +23,69 @@
 // 16 byte 连续,B 的 fragment 需要 k 方向相邻的字节成对进 b16——
 // 想清楚哪种布局能满足它。
 //
-// TODO: 实现两个装载函数。
+// 手工装载:1.1 的公式逐字节收数。A 从 sA([16][32] 行主序)读,
+// B 从 sBk([32][8] k-major)读。
 __device__ void load_manual(const uint8_t* sA, const uint8_t* sBk,
                             const uint8_t* sBn, unsigned (&a)[4],
                             unsigned (&b)[2]) {
-    (void)sA; (void)sBk; (void)sBn; (void)a; (void)b;
+    int lane = threadIdx.x;
+    int group = lane >> 2, tig = lane & 3;
+#pragma unroll
+    for (int r = 0; r < 4; r++) {
+        unsigned reg = 0;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int row = group + ((r & 1) ? 8 : 0);
+            int col = tig * 4 + (r >> 1) * 16 + j;
+            reg |= (unsigned)sA[row * 32 + col] << (8 * j);
+        }
+        a[r] = reg;
+    }
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        unsigned reg = 0;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int k = tig * 4 + r * 16 + j;
+            reg |= (unsigned)sBk[k * 8 + group] << (8 * j);
+        }
+        b[r] = reg;
+    }
+    (void)sBn;
 }
 
+// ldmatrix 装载。
+// A:16x32 的 fp8 按 b16 视角是 16 行 x 16 个 unit(1 unit = 2 个 fp8,
+//   沿 k 相邻)。fragment 的 reg r = (rowhalf = r&1, colhalf = r>>1) 的
+//   8x8 b16 tile,所以一次 .x4、四个 matrix 分别取
+//   (0,0) (1,0) (0,1) (1,1):lane l 为 matrix p = l>>3 提供第 l&7 行的
+//   起始地址,即 &sA[8*(p&1) + (l&7)][16*(p>>1)]。1.1 附加问的答案在这
+//   里兑现:同一 b32 里的 4 个 fp8 沿 k 相邻,恰好凑成 ldmatrix 的 16bit
+//   "元素",行主序 + 不带 .trans 正好落进寄存器。
+// B:fragment 的 16bit unit 是 (B[k][n], B[k+1][n])——k 相邻的同一列。
+//   sBk 里 k 相邻的元素差 8B 不连续,必须用 sBn(n-major,每列 32 个 k
+//   连续)才能满足 ldmatrix 的 16B 行地址要求。8 行(n) x 16 unit(k/2),
+//   .x2:matrix 0 = k 0-15,matrix 1 = k 16-31,lane 0-15 提供地址
+//   &sBn[(l&7)*32 + p*16]。
 __device__ void load_ldsm(const uint8_t* sA, const uint8_t* sBk,
                           const uint8_t* sBn, unsigned (&a)[4],
                           unsigned (&b)[2]) {
-    (void)sA; (void)sBk; (void)sBn; (void)a; (void)b;
+    int lane = threadIdx.x;
+    int p = lane >> 3;
+    unsigned addrA = (unsigned)__cvta_generic_to_shared(
+        sA + (8 * (p & 1) + (lane & 7)) * 32 + 16 * (p >> 1));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+        : "r"(addrA));
+
+    unsigned addrB = (unsigned)__cvta_generic_to_shared(sBn +
+                                                        (lane & 7) * 32 +
+                                                        ((lane >> 3) & 1) * 16);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(b[0]), "=r"(b[1])
+                 : "r"(addrB));
+    (void)sA; (void)sBk; (void)sBn;
 }
 
 template <bool USE_LDSM>

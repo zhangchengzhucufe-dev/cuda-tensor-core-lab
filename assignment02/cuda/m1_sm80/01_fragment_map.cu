@@ -16,11 +16,35 @@
 #include <cstdio>
 #include <cstdint>
 
-// TODO: 实现四个函数。lane 0-31;A 的 i 0-15,B 的 i 0-7。
-static int a_row_of(int lane, int i) { (void)lane; (void)i; return 0; }
-static int a_col_of(int lane, int i) { (void)lane; (void)i; return 0; }
-static int b_row_of(int lane, int i) { (void)lane; (void)i; return 0; }  // k
-static int b_col_of(int lane, int i) { (void)lane; (void)i; return 0; }  // n
+// m16n8k32 e4m3 的 fragment 映射(对照 PTX ISA "Matrix Fragments for
+// mma.m16n8k32"):
+//   记 group = lane>>2(行方向的 8 个组),tig = lane&3(组内 4 线程),
+//   r = i/4 是第几个 b32 寄存器,j = i&3 是寄存器内第几个 byte。
+//   A(16x32):
+//     r=0: row = group,       col = tig*4 + j
+//     r=1: row = group + 8,   col = tig*4 + j
+//     r=2: row = group,       col = tig*4 + 16 + j
+//     r=3: row = group + 8,   col = tig*4 + 16 + j
+//   B(32x8,col 布局,n 在列):
+//     r=0: k = tig*4 + j
+//     r=1: k = tig*4 + 16 + j
+//     n = group(两个寄存器相同)
+static int a_row_of(int lane, int i) {
+    int group = lane >> 2, r = i / 4;
+    return group + (r & 1) * 8;
+}
+static int a_col_of(int lane, int i) {
+    int tig = lane & 3, r = i / 4, j = i & 3;
+    return tig * 4 + (r >> 1) * 16 + j;
+}
+static int b_row_of(int lane, int i) {  // k
+    int tig = lane & 3, r = i / 4, j = i & 3;
+    return tig * 4 + r * 16 + j;
+}
+static int b_col_of(int lane, int i) {  // n
+    (void)i;
+    return lane >> 2;
+}
 
 // 以下为判测,不需要修改。表项 = row * 32 + col(A)/ k * 8 + n(B)。
 static const short A_POS[32 * 16] = {

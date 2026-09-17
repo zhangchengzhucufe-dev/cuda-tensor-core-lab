@@ -79,5 +79,11 @@ int main(){
     delete[] arrC1;
     delete[] arrC2;
     delete[] arrC;
+
+    cudaFree(d_arrC1);
+    cudaFree(d_arrC2);
+    cudaFree(arrG1);
+    cudaFree(arrG2);
+    cudaFree(arrG3);
 }
 

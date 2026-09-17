@@ -1,13 +1,9 @@
 #include "GPUTimer.h"
+#include "CPURandom.h"
 #include <cstddef>
 #include <cuda_runtime.h>
 #include <iostream>
 #include <chrono>
-#include <random>
-
-std::random_device rd;
-std::mt19937 gen(rd());
-std::uniform_real_distribution<float> dist_float(0.0f, 10.5f);
 
 __global__ void one_thread(float *arrG1, const int n, float *d_arrC1, float *d_arrC2){
     for (int i = 0; i < n; i++) arrG1[i] = d_arrC1[i] + d_arrC2[i];
@@ -61,18 +57,21 @@ int main(){
     GPUTimer timerOneThread;
     timerOneThread.Start();
     for (int i = 0; i < 10; i++) one_thread<<<1, 1>>>(arrG1, n, d_arrC1, d_arrC2);
+    cudaDeviceSynchronize();
     timerOneThread.End();
     std::cout <<  "oneThread " <<timerOneThread.Elapsed() / 10 <<"ms" << std::endl;
 
     GPUTimer timerOneBlock;
     timerOneBlock.Start();
     for (int i = 0; i < 10; i++) one_block<<<1, 256>>>(n, arrG2, d_arrC1, d_arrC2);
+    cudaDeviceSynchronize();
     timerOneBlock.End();
     std::cout <<  "oneBlock " <<timerOneBlock.Elapsed() / 10 << "ms" <<std::endl;
     
     GPUTimer timerGrid;
     timerGrid.Start();
     for (int i = 0; i < 10; i++) add_grid<<<128, 256>>>(n, arrG3, d_arrC1, d_arrC2);
+    cudaDeviceSynchronize();
     timerGrid.End();
     std::cout << "add_grid " <<timerGrid.Elapsed() / 10 << "ms" <<std::endl;
 

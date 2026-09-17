@@ -85,4 +85,3 @@ int main(){
     cudaFree(arrG2);
     cudaFree(arrG3);
 }
-

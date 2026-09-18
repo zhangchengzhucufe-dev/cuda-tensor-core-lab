@@ -22,7 +22,4 @@ __global__ void GPUrandI(unsigned long long seed, const int n, int *arr){
     arr[tid] = curand_uniform(&state);
 }
 
-
-
-
 #endif

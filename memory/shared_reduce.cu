@@ -68,6 +68,7 @@ int main() {
     for (int i = 0; i < n; i++) h_in[i] = dist_float(gen);
     auto t2 = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds> (t2 - t1);
+    printf("CPU random fill consumes %lld ms\n", duration.count());
 
     GPUTimer timerConti;
     timerConti.Start();
@@ -85,6 +86,8 @@ int main() {
 
     cudaFree(d_in);
     free(h_in);
+    cudaFree(d_conti);
+    cudaFree(d_inter);
 
     return 0;
 }

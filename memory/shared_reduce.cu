@@ -41,6 +41,7 @@ __global__ void reduce_contiguous(float *d_in, const int n){
 
 }
 
+
 int main() {
     const size_t n = 1 << 26;
     float *d_in, *h_in;

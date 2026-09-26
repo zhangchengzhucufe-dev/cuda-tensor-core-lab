@@ -10,14 +10,16 @@
 //
 // This is the file that ties the other examples together: the tiled GEMM
 // from 03, the block reductions from 09, the fused online-softmax attention
-// from 10, and the bias+gelu fusion all show up as stages here. Real
-// models use multiple attention heads -- per head the math is identical,
-// heads just run as independent copies of this (or get packed into the
-// same kernel). Single head keeps the CPU reference readable.
+// from 10, and the bias+gelu fusion all show up as stages here. Attention
+// runs 4 heads of 32 dims each, packed into the qkv buffer -- the per-head
+// math is identical, and the concatenated head outputs feed Wproj without
+// any reshuffling.
 //
 // Every stage is timed separately, and the whole thing is verified against
-// a plain double-precision CPU implementation. This is also the kind of
-// fixed kernel sequence you'd capture with CUDA graphs (see 13_graphs).
+// a plain double-precision CPU implementation. And since the stage timings
+// below turn out to be mostly launch overhead at this size, the same
+// forward is also captured into a CUDA graph (see 13_graphs) and replayed,
+// eager vs graph, at the end.
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -26,7 +28,8 @@
 
 // ---- sizes (all multiples of the GEMM tile, keeps the kernels branch-free) ----
 #define S 128     // sequence length
-#define D 128     // model dim (also the attention head dim here)
+#define D 128     // model dim
+#define NH 4      // attention heads (D must be divisible by NH)
 #define FFN 512   // mlp hidden dim
 #define TILE 32
 
@@ -106,18 +109,24 @@ __global__ void gemm_tiled(const float* A, const float* B, float* C,
     if (row < M && col < N) C[static_cast<size_t>(row) * N + col] = acc;
 }
 
-// Fused online-softmax attention. Q/K/V point at their slices of the qkv
-// buffer (row stride ld), so one GEMM output feeds all three.
+// Fused online-softmax attention, multi-head. One block per (query, head),
+// blockDim.x == head dim. Q/K/V point at their slices of the packed qkv
+// buffer (row stride ld); inside a slice, head h owns columns
+// [h*dh, (h+1)*dh). Each head writes its Dh outputs contiguously into the
+// [S, D] attention output, which is exactly the layout Wproj consumes --
+// so going from 1 head to 4 costs nothing in the surrounding GEMMs.
 // (param names dodge the size macros above)
-__global__ void attention_online(const float* Q, const float* K, const float* V,
-                                 float* O, int n_seq, int dh, int ld, float scale) {
+__global__ void attention_multihead(const float* Q, const float* K, const float* V,
+                                    float* O, int n_seq, int dh, int nh, int ld,
+                                    float scale) {
     __shared__ float warp_buf[32];
-    int q = blockIdx.x;
+    int q = blockIdx.x / nh;
+    int h = blockIdx.x % nh;
     int dim = threadIdx.x;  // one thread per head dim, blockDim.x == dh
 
-    float qv = Q[static_cast<size_t>(q) * ld + dim];
-    const float* kcol = K + dim;  // column 'dim' of every key row
-    const float* vcol = V + dim;
+    float qv = Q[static_cast<size_t>(q) * ld + h * dh + dim];
+    const float* kcol = K + h * dh + dim;  // column 'dim' of every key row
+    const float* vcol = V + h * dh + dim;
 
     float m = -INFINITY, l = 0.f, acc = 0.f;
     for (int k = 0; k < n_seq; ++k) {
@@ -129,7 +138,7 @@ __global__ void attention_online(const float* Q, const float* K, const float* V,
         l = l * p + e;
         m = m_new;
     }
-    O[static_cast<size_t>(q) * dh + dim] = acc / l;
+    O[static_cast<size_t>(q) * (nh * dh) + h * dh + dim] = acc / l;
 }
 
 // out = a + b, the residuals
@@ -203,30 +212,35 @@ static void cpu_block_forward(const std::vector<float>& x,
     cpu_gemm(std::vector<float>(ln1.begin(), ln1.end()), wqkv, qkv, S, 3 * D, D);
     for (size_t i = 0; i < qkv.size(); ++i) qkv[i] += bqkv[i % (3 * D)];
 
-    // attention, one head of dim D
-    float scale = 1.f / std::sqrt(static_cast<float>(D));
+    // attention over NH heads of D/NH dims each. The packed qkv layout puts
+    // all heads of Q first, then K, then V; head h owns columns
+    // [h*dh, (h+1)*dh) inside each slice
+    const int dh = D / NH;
+    float hscale = 1.f / std::sqrt(static_cast<float>(dh));
     std::vector<double> attn(static_cast<size_t>(S) * D, 0.0);
     std::vector<double> scores(S);
-    for (int q = 0; q < S; ++q) {
-        double m = -INFINITY;
-        for (int k = 0; k < S; ++k) {
-            double dot = 0.0;
-            for (int d = 0; d < D; ++d)
-                dot += qkv[static_cast<size_t>(q) * (3 * D) + d] *          // Q slice
-                       qkv[static_cast<size_t>(k) * (3 * D) + D + d];      // K slice
-            scores[k] = dot * scale;
-            m = std::max(m, scores[k]);
-        }
-        double denom = 0.0;
-        for (int k = 0; k < S; ++k) {
-            scores[k] = std::exp(scores[k] - m);
-            denom += scores[k];
-        }
-        for (int d = 0; d < D; ++d) {
-            double acc = 0.0;
-            for (int k = 0; k < S; ++k)
-                acc += scores[k] * qkv[static_cast<size_t>(k) * (3 * D) + 2 * D + d];  // V slice
-            attn[static_cast<size_t>(q) * D + d] = acc / denom;
+    for (int h = 0; h < NH; ++h) {
+        for (int q = 0; q < S; ++q) {
+            double m = -INFINITY;
+            for (int k = 0; k < S; ++k) {
+                double dot = 0.0;
+                for (int d = 0; d < dh; ++d)
+                    dot += qkv[static_cast<size_t>(q) * (3 * D) + h * dh + d] *        // Q slice
+                           qkv[static_cast<size_t>(k) * (3 * D) + D + h * dh + d];    // K slice
+                scores[k] = dot * hscale;
+                m = std::max(m, scores[k]);
+            }
+            double denom = 0.0;
+            for (int k = 0; k < S; ++k) {
+                scores[k] = std::exp(scores[k] - m);
+                denom += scores[k];
+            }
+            for (int d = 0; d < dh; ++d) {
+                double acc = 0.0;
+                for (int k = 0; k < S; ++k)
+                    acc += scores[k] * qkv[static_cast<size_t>(k) * (3 * D) + 2 * D + h * dh + d];  // V slice
+                attn[static_cast<size_t>(q) * D + h * dh + d] = acc / denom;
+            }
         }
     }
 
@@ -256,9 +270,10 @@ static void cpu_block_forward(const std::vector<float>& x,
 
 int main() {
     std::srand(0);
-    float scale = 1.f / std::sqrt(static_cast<float>(D));
-    std::printf("transformer block fwd: seq=%d, d=%d, ffn=%d (single head, pre-norm)\n",
-                S, D, FFN);
+    const int dh = D / NH;
+    float scale = 1.f / std::sqrt(static_cast<float>(dh));  // per-head scale
+    std::printf("transformer block fwd: seq=%d, d=%d, %d heads x %d, ffn=%d (pre-norm)\n",
+                S, D, NH, dh, FFN);
 
     // small weights so activations stay O(1)
     auto rnd = [](size_t n, float lo, float hi) {
@@ -335,7 +350,7 @@ int main() {
 
     timer.start();
     // Q/K/V are column slices of d_qkv, all with row stride 3*D
-    attention_online<<<S, D>>>(d_qkv, d_qkv + D, d_qkv + 2 * D, d_attn, S, D, 3 * D, scale);
+    attention_multihead<<<S * NH, dh>>>(d_qkv, d_qkv + D, d_qkv + 2 * D, d_attn, S, dh, NH, 3 * D, scale);
     CHECK_KERNEL_LAUNCH();
     t_att = timer.stop();
 
@@ -387,5 +402,72 @@ int main() {
     }
     std::printf("verification passed against the double-precision CPU block\n");
 
+    // ---- the same forward as one cuda graph ----
+    // the stage timings above are mostly launch gaps at this size, so do
+    // what inference engines do for small decode steps: capture the whole
+    // sequence once, then submit it with one call per iteration
+    const int ITERS = 50;
+    auto run_block = [&](cudaStream_t stream) {
+        layernorm_tb<<<S, D, 0, stream>>>(d_x, d_g1, d_bt1, d_ln1, S, D, 1e-5f);
+        gemm_tiled<<<dim3(3 * D / TILE, S / TILE), gemm_block, 0, stream>>>(
+            d_ln1, d_wqkv, d_qkv, S, 3 * D, D);
+        bias_add_tb<<<qkv_grid, block, 0, stream>>>(d_qkv, d_bqkv, d_qkv, s3d, 3 * D);
+        attention_multihead<<<S * NH, dh, 0, stream>>>(d_qkv, d_qkv + D, d_qkv + 2 * D,
+                                                       d_attn, S, dh, NH, 3 * D, scale);
+        gemm_tiled<<<dim3(D / TILE, S / TILE), gemm_block, 0, stream>>>(
+            d_attn, d_wproj, d_tmp, S, D, D);
+        add_rows<<<vec_grid, block, 0, stream>>>(d_x, d_tmp, d_res1, sd);
+        layernorm_tb<<<S, D, 0, stream>>>(d_res1, d_g2, d_bt2, d_ln2, S, D, 1e-5f);
+        gemm_tiled<<<dim3(FFN / TILE, S / TILE), gemm_block, 0, stream>>>(
+            d_ln2, d_w1, d_ffn, S, FFN, D);
+        bias_gelu_tb<<<ffn_grid, block, 0, stream>>>(d_ffn, d_b1, d_ffn, sf, FFN);
+        gemm_tiled<<<dim3(D / TILE, S / TILE), gemm_block, 0, stream>>>(
+            d_ffn, d_w2, d_tmp, S, D, FFN);
+        bias_add_tb<<<vec_grid, block, 0, stream>>>(d_tmp, d_b2, d_tmp, sd, D);
+        add_rows<<<vec_grid, block, 0, stream>>>(d_res1, d_tmp, d_res2, sd);
+    };
+
+    // eager: the whole 12-launch sequence, ITERS times
+    timer.start();
+    for (int i = 0; i < ITERS; ++i) run_block(nullptr);
+    CHECK_KERNEL_LAUNCH();
+    float ms_eager = timer.stop();
+
+    // capture once, replay ITERS times
+    cudaStream_t cs;
+    CUDA_CHECK(cudaStreamCreate(&cs));
+    CUDA_CHECK(cudaStreamBeginCapture(cs, cudaStreamCaptureModeGlobal));
+    run_block(cs);
+    cudaGraph_t graph;
+    CUDA_CHECK(cudaStreamEndCapture(cs, &graph));
+    cudaGraphExec_t gexec;
+    CUDA_CHECK(cudaGraphInstantiate(&gexec, graph, nullptr, nullptr, 0));
+
+    timer.start();
+    for (int i = 0; i < ITERS; ++i) CUDA_CHECK(cudaGraphLaunch(gexec, nullptr));
+    float ms_graph = timer.stop();
+
+    std::printf("whole block x%d: eager %.3f ms, graph %.3f ms (%.2fx)\n",
+                ITERS, ms_eager, ms_graph, ms_eager / ms_graph);
+    std::printf("only a modest win here: these kernels do enough real work\n"
+                " (~300 us/iter on the GPU) that the CPU mostly keeps up even\n"
+                " eager. the 13_graphs demo with deliberately tiny kernels is\n"
+                " where capture pays properly -- same mechanism, different ratio\n");
+
+    // graph replays rewrote d_res2; inputs are unchanged so it must match again
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_res2, sd * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < h_out.size(); ++i) {
+        double limit = 2e-3 * (1.0 + std::fabs(h_ref[i]));
+        if (std::fabs(h_out[i] - h_ref[i]) > limit) {
+            std::fprintf(stderr, "graph replay FAILED at %zu\n", i);
+            return 1;
+        }
+    }
+    std::printf("graph replay output still matches the reference\n");
+
+    cudaGraphExecDestroy(gexec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(cs);
     return 0;
 }

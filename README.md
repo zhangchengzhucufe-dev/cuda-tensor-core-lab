@@ -43,6 +43,7 @@ Individual examples take size args if you want them:
 | `04_scan/` | `prefix_sum.cu` | work-efficient Blelloch scan + the three-pass trick for arrays bigger than a block |
 | `05_histogram/` | `histogram.cu` | atomics: global `atomicAdd` contention -> shared memory privatization + coarsening (~17x) |
 | `06_stencil/` | `conv2d_tiled.cu` | 2D conv with halo loading; the divide/mod pattern handles edges and corners with no special cases |
+| | `conv2d_constmem.cu` | `__constant__` weights: cudaMemcpyToSymbol, warp broadcast semantics -- and a measured case where it doesn't help |
 | `07_streams/` | `stream_overlap.cu` | pinned memory + `cudaMemcpyAsync` + multi-stream pipelining |
 | `08_gemm_opt/` | `sgemm_register_tile.cu` | 2D register tiling (8x8 per thread) + `float4` loads: the biggest single step in the GEMM ladder |
 | | `sgemm_double_buffer.cu` | cp.async double buffering -- and why it *didn't* help at BK=8 (honest negative result, notes in the file) |

@@ -55,7 +55,7 @@ Individual examples take size args if you want them:
 | `11_sparse/` | `spmv_csr.cu` | CSR SpMV, thread-per-row vs warp-per-row -- pick granularity to match row length |
 | `12_sort/` | `bitonic_sort.cu` | branch-free compare-exchange network, O(n log^2 n), why GPUs tolerate that |
 | `13_graphs/` | `cuda_graphs.cu` | stream capture + graph replay; kills most of the launch overhead for tiny kernels |
-| `14_transformer_block/` | `transformer_block.cu` | a full pre-norm block forward (ln -> qkv -> online-softmax attention -> proj -> residual -> mlp), all kernels from the earlier dirs as stages, verified end-to-end against a double-precision CPU pass |
+| `14_transformer_block/` | `transformer_block.cu` | a full pre-norm block forward (ln -> qkv -> 4-head online-softmax attention -> proj -> residual -> mlp), all kernels from the earlier dirs as stages, verified end-to-end against a double-precision CPU pass, plus eager-vs-cuda-graph replay of the whole sequence |
 | `docs/` | `profiling.md` | nsys runs on the real card: what the timings are made of, and the ncu commands I'd run on a counter-enabled box |
 
 ## Numbers worth knowing (RTX 3060 Laptop)
@@ -65,7 +65,9 @@ Individual examples take size args if you want them:
 - GEMM at 2048^3: naive 536 GFLOPS -> register-tile ~4.7 TFLOPS -> cuBLAS ~6.6 TFLOPS
 - histogram: naive 6.8 ms -> privatized 0.4 ms
 - bias+GELU fusion: 2.0 ms -> 0.64 ms (memory bound, so fusion ≈ 2x)
-- CUDA graphs: ~40-70% total time saved on a 3-tiny-kernel pipeline
+- CUDA graphs: ~40-70% total time saved on a 3-tiny-kernel pipeline; on
+  the transformer block (kernels with real work) only ~1.07x -- knowing
+  when a tool doesn't apply is half the point
 
 ## Two quirks of this test machine (native Linux won't have these)
 
@@ -98,7 +100,7 @@ Individual examples take size args if you want them:
 
 - 3-4 stage cp.async pipeline or BK=16, to make the double-buffer version
   actually pay (see the notes in the file for why 2 stages at BK=8 doesn't)
-- multi-head + multi-query-per-block attention, then flash style tiling
+- multi-query-per-block attention, then flash style tiling over keys
 - wrap the register-tile GEMM and layernorm as a torch extension and
   benchmark against `torch.nn`
 - counter-level analysis needs a non-WSL2 machine: the exact ncu commands

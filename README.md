@@ -1,11 +1,13 @@
 # CUDA Tensor Core Lab
 
+[![build](https://github.com/zhangchengzhucufe-dev/cuda-tensor-core-lab/actions/workflows/build.yml/badge.svg)](https://github.com/zhangchengzhucufe-dev/cuda-tensor-core-lab/actions/workflows/build.yml)
+
 A bunch of CUDA kernels I wrote while working through the standard material
 (PMPP 3rd ed., the GPU-mode lectures, assorted GEMM blogs). Everything runs
 and self-checks against a CPU reference, and every example prints real
 timings so you can see the optimization actually pay off. Difficulty is
 intermediate: shared memory, warp intrinsics, atomics, WMMA tensor cores,
-graphs -- no hand-written PTX, no CUTLASS.
+cp.async, graphs -- no hand-written PTX, no CUTLASS.
 
 Hardware these were tested on: RTX 3060 Laptop (Ampere, `sm_86`), CUDA 13.x.
 Numbers below are from this card; yours will differ.
@@ -43,6 +45,7 @@ Individual examples take size args if you want them:
 | `06_stencil/` | `conv2d_tiled.cu` | 2D conv with halo loading; the divide/mod pattern handles edges and corners with no special cases |
 | `07_streams/` | `stream_overlap.cu` | pinned memory + `cudaMemcpyAsync` + multi-stream pipelining |
 | `08_gemm_opt/` | `sgemm_register_tile.cu` | 2D register tiling (8x8 per thread) + `float4` loads: the biggest single step in the GEMM ladder |
+| | `sgemm_double_buffer.cu` | cp.async double buffering -- and why it *didn't* help at BK=8 (honest negative result, notes in the file) |
 | | `sgemm_vs_cublas.cu` | same data, me vs cuBLAS. Reaches ~71% of cuBLAS at 2048^3 on this card |
 | `09_nn_ops/` | `softmax_rowwise.cu` | safe softmax, thread-per-row vs block-per-row; reusable block reduction helper |
 | | `layernorm.cu` | two block reductions, `E[x^2] - mean^2` variance, and why that's okay here |
@@ -51,6 +54,8 @@ Individual examples take size args if you want them:
 | `11_sparse/` | `spmv_csr.cu` | CSR SpMV, thread-per-row vs warp-per-row -- pick granularity to match row length |
 | `12_sort/` | `bitonic_sort.cu` | branch-free compare-exchange network, O(n log^2 n), why GPUs tolerate that |
 | `13_graphs/` | `cuda_graphs.cu` | stream capture + graph replay; kills most of the launch overhead for tiny kernels |
+| `14_transformer_block/` | `transformer_block.cu` | a full pre-norm block forward (ln -> qkv -> online-softmax attention -> proj -> residual -> mlp), all kernels from the earlier dirs as stages, verified end-to-end against a double-precision CPU pass |
+| `docs/` | `profiling.md` | nsys runs on the real card: what the timings are made of, and the ncu commands I'd run on a counter-enabled box |
 
 ## Numbers worth knowing (RTX 3060 Laptop)
 
@@ -77,10 +82,23 @@ Individual examples take size args if you want them:
 - non-deterministic float accumulation (`sums[bid] += out[i]` from 256
   racing threads) made my graphs example un-verifiable. Tree-reduce in
   shared memory instead.
+- cp.async faults with "misaligned address" if the shared tile pad isn't a
+  multiple of 4 floats: the `[BK][BN+1]` trick from the transpose example
+  breaks 16B alignment. Pad to +4 there.
+- transformer block: the bias-add after the qkv GEMM launched with a grid
+  sized for S*D elements over an S*3*D buffer -- only the Q slice got its
+  bias. Underlaunches like this don't crash, they just produce quietly
+  wrong numbers. Found it by diffing stages against the CPU reference.
+- same file, the CPU reference itself used the layernorm output as Q
+  instead of the projected Q. The GPU was right and the reference was
+  wrong, which is its own lesson: verify the verifier.
 
 ## Ideas if you want to go further
 
-- double-buffer the GEMM K loop with `cp.async`, measure again
+- 3-4 stage cp.async pipeline or BK=16, to make the double-buffer version
+  actually pay (see the notes in the file for why 2 stages at BK=8 doesn't)
 - multi-head + multi-query-per-block attention, then flash style tiling
-- try `ncu --set full` on the register-tile GEMM and chase the occupancy /
-  register pressure numbers
+- wrap the register-tile GEMM and layernorm as a torch extension and
+  benchmark against `torch.nn`
+- counter-level analysis needs a non-WSL2 machine: the exact ncu commands
+  are waiting in docs/profiling.md

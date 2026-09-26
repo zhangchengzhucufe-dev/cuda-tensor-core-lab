@@ -79,15 +79,3 @@ inline bool compare_close(const float* a, const float* b, size_t n, float tol) {
     }
     return true;
 }
-
-// Exact compare for int arrays.
-inline bool compare_equal(const int* a, const int* b, size_t n) {
-    for (size_t i = 0; i < n; ++i) {
-        if (a[i] != b[i]) {
-            std::fprintf(stderr, "mismatch at i=%zu: got %d, expect %d\n", i,
-                         a[i], b[i]);
-            return false;
-        }
-    }
-    return true;
-}

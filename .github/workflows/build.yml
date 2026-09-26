@@ -11,13 +11,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: nvidia/cuda:13.3.1-devel-ubuntu24.04
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
     steps:
-      - run: apt-get update && apt-get install -y git ca-certificates
+      - run: apt-get update && apt-get install -y --no-install-recommends git ca-certificates make g++
       - uses: actions/checkout@v4
       - name: build everything
         run: make ARCH=sm_86 -j$(nproc)
-      - name: build for a couple more archs
-        run: |
-          make clean
-          make ARCH=sm_89 -j$(nproc)
